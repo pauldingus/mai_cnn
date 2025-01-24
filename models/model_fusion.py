@@ -64,6 +64,7 @@ def build_siamese_fusion_model(
     # Compile the model - using Binary Crossentropy
     model.compile(
         optimizer=optimizers.Adam(learning_rate=1e-4),
+        loss='binary_crossentropy',
         metrics=['accuracy']  # or any custom multi-label metrics
     )
 
