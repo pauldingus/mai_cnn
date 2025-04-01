@@ -45,8 +45,16 @@ def replace_invalid_and_crop(arr: np.ndarray, target_size: int = 128) -> np.ndar
     return arr
 
 # ------------------------------------------------------------------------
-# 2. Data Pipeline Class
+# 2. Data Pipeline Classes
 # ------------------------------------------------------------------------
+
+class CustomMinMaxScaler:
+    def __init__(self, min_val=0, max_val=40):
+        self.min_val = min_val
+        self.max_val = max_val
+
+    def transform(self, X):
+        return (X - self.min_val) / (self.max_val - self.min_val)
 
 class TFDatasetBuilder:
     """
@@ -85,7 +93,7 @@ class TFDatasetBuilder:
         self.lower_clip = lower_clip
         self.upper_clip = upper_clip
 
-        # Robust scaler
+        # Scaler
         self.scaler = None
 
         # Final file/label lists
@@ -132,7 +140,7 @@ class TFDatasetBuilder:
         elif self.scaling == 'standard':
             self._fit_standard_scaler(sample_size=sample_size)
         elif self.scaling == 'minmax':
-            self._fit_minmax_scaler(sample_size=sample_size)
+            self._fit_minmax_scaler()
 
         # 4) Build the datasets
         train_ds = self._build_tf_dataset(
@@ -224,34 +232,12 @@ class TFDatasetBuilder:
         self.scaler = StandardScaler()
         self.scaler.fit(features)
 
-    def _fit_minmax_scaler(self, sample_size=100):
+    def _fit_minmax_scaler(self):
         """
         Fit a min-max scaler on a sample of the training data.
         """
-        if len(self.train_paths) == 0:
-            return
-
-        sample_paths = random.sample(list(self.train_paths), min(sample_size, len(self.train_paths)))
-        features = []
-        for path in sample_paths:
-            arr = read_tif(path)
-            arr = replace_invalid_and_crop(arr, 128)
-
-            # Optional: clip
-            if self.do_clipping:
-                arr = np.clip(arr, self.lower_clip, self.upper_clip)
-
-            # Flatten each day => shape (7, 128*128)
-            flat = arr.reshape(arr.shape[0], -1)
-            features.append(flat)
-
-        if not features:
-            self.scaler = None
-            return
-
-        features = np.concatenate(features, axis=0)  # (7*n_samples, 128*128)
-        self.scaler = MinMaxScaler(feature_range=(0, 1))
-        self.scaler.fit(features)
+        # Custom MinMaxScaler
+        self.scaler = CustomMinMaxScaler(min_val=self.lower_clip, max_val=self.upper_clip)
 
     def _build_tf_dataset(self, paths, labels, batch_size, shuffle=False, buffer_size=1000):
         """
@@ -294,7 +280,7 @@ class TFDatasetBuilder:
           - replace inf/nan -> 0
           - crop
           - clip [lower_clip, upper_clip]
-          - robust scaling
+          - scaling
           - expand dims => (7,128,128,1)
         """
         path_str = path.numpy().decode('utf-8')
@@ -352,6 +338,42 @@ class TFDatasetBuilder:
         # else no rotation
 
         return arr
+    
+# ------------------------------------------------------------------------
+# 3. Prepping New Data for Prediction
+# ------------------------------------------------------------------------
+
+def preprocess_new_data(arr, scaler=None, do_clipping=True, lower_clip=0, upper_clip=40):
+    """
+    Preprocess a new ndarray for prediction.
+    
+    Args:
+        arr: Input ndarray of shape (7, H, W).
+        scaler: Fitted scaler (e.g., RobustScaler, StandardScaler, MinMaxScaler).
+        do_clipping: Whether to apply clipping.
+        lower_clip: Lower bound for clipping.
+        upper_clip: Upper bound for clipping.
+    
+    Returns:
+        Preprocessed ndarray of shape (7, 128, 128, 1).
+    """
+    # Replace invalid values and crop
+    arr = replace_invalid_and_crop(arr, 128)
+
+    # Clip values
+    if do_clipping:
+        arr = np.clip(arr, lower_clip, upper_clip)
+
+    # Scale values
+    if scaler is not None:
+        flat = arr.reshape(arr.shape[0], -1)
+        flat = scaler.transform(flat)
+        arr = flat.reshape(arr.shape)
+
+    # Expand dimensions
+    arr = arr[..., np.newaxis]
+
+    return arr.astype(np.float32)
 
 # ------------------------------------------------------------------------
 # 3. Example main() demonstrating usage
@@ -370,7 +392,7 @@ def main():
                         help="If set, apply random flips/rot90 during training")
     parser.add_argument("--do_clipping", action='store_true',
                         help="If set, clip values at min/max values (default: 0/40)")
-    parser.add_argument("--lower_clip", type=int, default=0,
+    parser.add_argument("--lower_clip", type=int, default=0, #could take the absolute calue instead of this
                         help="Lower value to clip at, default 0")
     parser.add_argument("--upper_clip", type=int, default=40,
                         help="Upper value to clip at, default 0")
@@ -396,9 +418,21 @@ def main():
     # model.fit(train_ds, epochs=20, validation_data=val_ds)
 
     # Just show a quick sanity check
+    import matplotlib.pyplot as plt
+
     for images, labels in train_ds.take(1):
         print("Image batch shape:", images.shape)  # (batch_size, 7, 128, 128, 1)
         print("Label batch shape:", labels.shape)  # (batch_size, 8)
+        
+        # Plot histograms for the first 10 images in the batch
+        for i in range(min(10, images.shape[0])):
+            plt.figure(figsize=(10, 4))
+            for j in range(7):  # 7 bands
+                plt.subplot(1, 7, j + 1)
+                plt.hist(images[i, j, :, :, 0].numpy().flatten(), bins=50)
+                plt.title(f'Band {j+1}')
+            plt.suptitle(f'Image {i+1}')
+            plt.show()
         break
 
 if __name__ == "__main__":

@@ -1,0 +1,1 @@
+#train a separable convolution model that performs spatial and temporal feature extraction
