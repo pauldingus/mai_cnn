@@ -1,5 +1,6 @@
 # Ignore data
-data/
+data/training_data_planet/
+data/training_data_S2/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
