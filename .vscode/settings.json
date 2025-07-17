@@ -1,3 +1,13 @@
 {
-    "python.defaultInterpreterPath": "\"/Users/pauldingus/Documents/MAI/mai_cnn/.venv/bin/python\""
+    "python.defaultInterpreterPath": "\"/Users/pauldingus/Documents/MAI/mai_cnn/.venv/bin/python\"",
+    "search.exclude": {
+        "**/data": true,
+        "**/models": true,
+        "**/.git": true
+    },
+    "files.watcherExclude": {
+        "**/data/**": true,
+        "**/models/**": true,
+        "**/.git/**": true
+    }
 }
