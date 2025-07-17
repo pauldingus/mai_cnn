@@ -5,15 +5,18 @@ Creates tf.data.Dataset pipelines for multi-band (7-day) TIF images
 based on a CSV of file paths and correct outputs.
 """
 
+#######
+# install and use flipnslide?
+#######
+
 import random
 import argparse
 import numpy as np
 import pandas as pd
-from sklearn.discriminant_analysis import StandardScaler
 import tensorflow as tf
 import rasterio
-
-from sklearn.preprocessing import MinMaxScaler, RobustScaler
+from sklearn.discriminant_analysis import StandardScaler
+from sklearn.preprocessing import RobustScaler
 
 # ------------------------------------------------------------------------
 # 1. Utility Functions
@@ -71,6 +74,7 @@ class TFDatasetBuilder:
         csv_path: str = "./data/training_data_S2/image_metadata.csv",
         seed: int = 42,
         scaling: str = 'none', #options: 'none', 'minmax', 'standard', 'robust'
+        per_image_scaling: bool = False,
         do_augmentation: bool = False,
         do_clipping: bool = True,
         lower_clip: float = 0,
@@ -88,6 +92,7 @@ class TFDatasetBuilder:
         self.df = pd.read_csv(csv_path)
         self.seed = seed
         self.scaling = scaling
+        self.per_image_scaling = per_image_scaling
         self.do_augmentation = do_augmentation
         self.do_clipping  = do_clipping
         self.lower_clip = lower_clip
@@ -117,7 +122,7 @@ class TFDatasetBuilder:
           4) Build tf.data.Dataset for train/val/test
         """
 
-        # 1) Shuffle & split
+        # Shuffle & split
         indices = list(self.df.index)
         random.Random(self.seed).shuffle(indices)
 
@@ -134,15 +139,16 @@ class TFDatasetBuilder:
         self.val_paths,   self.val_labels   = self._extract_paths_and_labels(val_idx)
         self.test_paths,  self.test_labels  = self._extract_paths_and_labels(test_idx)
 
-        # 3) Fit robust scaler on the training data if needed
-        if self.scaling == 'robust':
-            self._fit_robust_scaler(sample_size=sample_size)
-        elif self.scaling == 'standard':
-            self._fit_standard_scaler(sample_size=sample_size)
-        elif self.scaling == 'minmax':
-            self._fit_minmax_scaler()
+        # Fit robust scaler on the training data if needed
+        if not self.per_image_scaling:
+            if self.scaling == 'robust':
+                self._fit_robust_scaler(sample_size=sample_size)
+            elif self.scaling == 'standard':
+                self._fit_standard_scaler(sample_size=sample_size)
+            elif self.scaling == 'minmax':
+                self._fit_minmax_scaler()
 
-        # 4) Build the datasets
+        # Build the datasets
         train_ds = self._build_tf_dataset(
             self.train_paths, self.train_labels, batch_size, shuffle=True, buffer_size=shuffle_buffer
         )
@@ -263,12 +269,15 @@ class TFDatasetBuilder:
         """
         Converts (path, label) to (processed_image, label).
         """
-        # 1) Load TIF as np array
+        # Load TIF as np array
         arr = tf.py_function(self._read_and_transform, [path], tf.float32)
         # We'll set a static shape for the returned array => (7, 128, 128, 1)
-        arr.set_shape((7, 128, 128, 1))
+        arr.set_shape((7, 128, 128))
 
-        # 2) (Optional) data augmentation
+        # Transpose to channels_last format (128, 128, 7)
+        arr = tf.transpose(arr, perm=[1, 2, 0])
+
+        # Data augmentation
         if self.do_augmentation:
             arr = self._augment_spatial(arr)
 
@@ -287,23 +296,40 @@ class TFDatasetBuilder:
         arr = read_tif(path_str)
         arr = replace_invalid_and_crop(arr, 128)
 
-        # 1) Clip
+        # Clip
         if self.do_clipping:
             arr = np.clip(arr, self.lower_clip, self.upper_clip)
 
-        # 2) scale
-        # Flatten each day => shape (7, 128*128)
-        if self.scaler is not None:
-            flat = arr.reshape(arr.shape[0], -1)
-            flat = self.scaler.transform(flat)
-            arr = flat.reshape(arr.shape)
+        # Scale
+        if not self.per_image_scaling:
+            if self.scaler is not None:
+                flat = arr.reshape(arr.shape[0], -1)
+                flat = self.scaler.transform(flat)
+                arr = flat.reshape(arr.shape)
 
-        # 3) Expand dims => (7, 128, 128, 1)
-        arr = arr[..., np.newaxis]
+        else:
+            if self.scaling == 'minmax':
+                flat = arr.flatten().reshape(-1, 1)
+                scaler = CustomMinMaxScaler(min_val=self.lower_clip, max_val=self.upper_clip)
+                scaler.fit(flat)
+                flat = scaler.transform(flat)
+                arr = flat.reshape(arr.shape)
+            elif self.scaling == 'standard':
+                flat = arr.flatten().reshape(-1, 1)
+                scaler = StandardScaler()
+                scaler.fit(flat)
+                flat = scaler.transform(flat)
+                arr = flat.reshape(arr.shape)
+            elif self.scaling == 'robust':
+                flat = arr.flatten().reshape(-1, 1)
+                scaler = RobustScaler()
+                scaler.fit(flat)
+                flat = scaler.transform(flat)
+                arr = flat.reshape(arr.shape)
 
         return arr.astype(np.float32)
 
-    def _augment_spatial(self, arr):
+    def _augment_spatial(self, img):
         """
         Example augmentation: random flip and random rotation by multiples of 90.
         (arr shape: (7, 128, 128, 1))
@@ -319,25 +345,15 @@ class TFDatasetBuilder:
         # But a simpler approach is to just treat the second dimension
         # as "batch of slices" with manual ops.
 
-        # random flip
-        flip_choice = tf.random.uniform(())
-        if flip_choice < 0.5:
-            arr = tf.reverse(arr, axis=[2])  # horizontal flip over W dimension
+        # Random flip
+        seed = tf.random.uniform([2], maxval=2**31 - 1, dtype=tf.int32)
+        img = tf.image.stateless_random_flip_left_right(img, seed)
 
-        # random rotation
-        rot_choice = tf.random.uniform(())
-        if rot_choice < 0.25:
-            # rotate 90
-            arr = tf.image.rot90(arr, k=1)  # rotates height/width
-        elif rot_choice < 0.5:
-            # rotate 180
-            arr = tf.image.rot90(arr, k=2)
-        elif rot_choice < 0.75:
-            # rotate 270
-            arr = tf.image.rot90(arr, k=3)
-        # else no rotation
+        # Random rotation
+        k = tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
+        img = tf.image.rot90(img, k)
 
-        return arr
+        return img
     
 # ------------------------------------------------------------------------
 # 3. Prepping New Data for Prediction
@@ -384,27 +400,34 @@ def main():
     parser.add_argument("--csv_path", type=str, default="./data/training_data_S2/image_metadata.csv",
                         help="Path to CSV with TIF paths and labels")
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--scaling", type=str, default='minmax',
+    parser.add_argument("--scaling", type=str, default='standard',
                         help="Type of scaling to apply: 'none', 'minmax', 'standard', 'robust'")
+    parser.add_argument("--per_image_scaling", action='store_true',
+                        help="If set, apply scaling per image instead of global scaler")
     parser.add_argument("--sample_size", type=int, default=100,
                         help="Number of images to sample for percentile/robust-scaler estimation")
     parser.add_argument("--do_augmentation", action='store_true',
                         help="If set, apply random flips/rot90 during training")
     parser.add_argument("--do_clipping", action='store_true',
                         help="If set, clip values at min/max values (default: 0/40)")
-    parser.add_argument("--lower_clip", type=int, default=0, #could take the absolute calue instead of this
+    parser.add_argument("--lower_clip", type=int, default=0,
                         help="Lower value to clip at, default 0")
     parser.add_argument("--upper_clip", type=int, default=40,
-                        help="Upper value to clip at, default 0")
+                        help="Upper value to clip at, default 40")
     args = parser.parse_args()
+
+    # Force per-image scaling for this test
+    args.per_image_scaling = True
+    args.scaling = 'standard'
 
     builder = TFDatasetBuilder(
         csv_path=args.csv_path,
         scaling=args.scaling,
-        do_augmentation = args.do_augmentation,
-        do_clipping = args.do_clipping,
-        lower_clip = args.lower_clip,
-        upper_clip = args.upper_clip
+        per_image_scaling=args.per_image_scaling,
+        do_augmentation=args.do_augmentation,
+        do_clipping=args.do_clipping,
+        lower_clip=args.lower_clip,
+        upper_clip=args.upper_clip
     )
 
     train_ds, val_ds, test_ds = builder.build_datasets(
@@ -413,25 +436,29 @@ def main():
         batch_size=args.batch_size
     )
 
-    # Example usage in a Keras model
-    # Suppose you already built a model `model = build_siamese_fusion_model(...)`
-    # model.fit(train_ds, epochs=20, validation_data=val_ds)
-
-    # Just show a quick sanity check
     import matplotlib.pyplot as plt
 
     for images, labels in train_ds.take(1):
-        print("Image batch shape:", images.shape)  # (batch_size, 7, 128, 128, 1)
-        print("Label batch shape:", labels.shape)  # (batch_size, 8)
-        
-        # Plot histograms for the first 10 images in the batch
-        for i in range(min(10, images.shape[0])):
-            plt.figure(figsize=(10, 4))
+        print("Image batch shape:", images.shape)
+        print("Label batch shape:", labels.shape)
+
+        # Check per-image scaling: print mean/std for each image in batch
+        print("Per-image mean/std values after scaling (should be ~0/1 for standard):")
+        for i in range(images.shape[0]):
+            img = images[i].numpy()
+            img_mean = np.mean(img)
+            img_std = np.std(img)
+            print(f"Image {i+1}: mean={img_mean:.4f}, std={img_std:.4f}")
+
+        # Plot histograms for the first 3 images in the batch
+        for i in range(min(3, images.shape[0])):
+            plt.figure(figsize=(14, 3))
             for j in range(7):  # 7 bands
                 plt.subplot(1, 7, j + 1)
-                plt.hist(images[i, j, :, :, 0].numpy().flatten(), bins=50)
+                plt.hist(images[i, :, :, j].numpy().flatten(), bins=50)
                 plt.title(f'Band {j+1}')
             plt.suptitle(f'Image {i+1}')
+            plt.tight_layout()
             plt.show()
         break
 

@@ -1,6 +1,19 @@
 # Ignore data
 data/training_data_planet/
 data/training_data_S2/
+data/training_data_planet_*/
+data/training_data_S2_*/
+data/archive/
+data/archive/*
+
+# Ignore saved models and predictions
+models/*/[0-9]*/
+
+# Ignore sbatch files
+*.sbatch
+
+# Ignore VS Code workspace settings
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
